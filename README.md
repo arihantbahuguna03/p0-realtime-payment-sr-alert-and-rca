@@ -1,6 +1,6 @@
 # P0 Payment SR Alert Agent (Airflow + Kubernetes + ClickHouse + Trino)
 
-> Stateful international card payment monitoring agent.
+> Stateful card payment SR monitoring agent.
 > Airflow is a **thin scheduler only** — all SQL, data processing and alerting
 > run inside an isolated Kubernetes pod so a script crash never affects the
 > Airflow worker or any other DAG.
@@ -9,7 +9,7 @@
 
 ## What problem does this solve?
 
-International card payment success rates (SR) can drop suddenly due to bank
+Card payment success rates (SR) can drop suddenly due to bank
 rejections, network outages, or gateway issues. The impact is large — even a
 5 % SR drop on a high-volume merchant means thousands of failed transactions.
 
@@ -102,19 +102,21 @@ survives Airflow restarts and pod recycling.
 
 ## Payment method segmentation
 
-Each transaction is classified into one of 9 buckets by `card_type × recurrence`:
+Each transaction is classified into one of 9 demo buckets by card
+attributes and transaction type (names are illustrative — replace with
+your own taxonomy):
 
-| Card type | Recurrence | Bucket |
-|---|---|---|
-| Credit | One-time | Demo Payment Method 1 |
-| Debit | One-time | Demo Payment Method 2 |
-| Prepaid | One-time | Demo Payment Method 3 |
-| Credit | Recurring – Auto | Demo Payment Method 4 |
-| Credit | Recurring – Initial / Card change | Demo Payment Method 5 |
-| Debit | Recurring – Auto | Demo Payment Method 6 |
-| Debit | Recurring – Initial / Card change | Demo Payment Method 7 |
-| Prepaid | Recurring – Auto | Demo Payment Method 8 |
-| Prepaid | Recurring – Initial / Card change | Demo Payment Method 9 |
+| Bucket | Description |
+|---|---|
+| Demo Payment Method 1 | Card type A — One-time |
+| Demo Payment Method 2 | Card type B — One-time |
+| Demo Payment Method 3 | Card type C — One-time |
+| Demo Payment Method 4 | Card type A — Recurring (auto) |
+| Demo Payment Method 5 | Card type A — Recurring (initial/change) |
+| Demo Payment Method 6 | Card type B — Recurring (auto) |
+| Demo Payment Method 7 | Card type B — Recurring (initial/change) |
+| Demo Payment Method 8 | Card type C — Recurring (auto) |
+| Demo Payment Method 9 | Card type C — Recurring (initial/change) |
 
 An **Overall** row (all segments combined) is also checked. Each merchant
 config specifies which segments to watch and their individual thresholds.

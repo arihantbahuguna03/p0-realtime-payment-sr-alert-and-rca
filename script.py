@@ -7,7 +7,7 @@ Slack alerts with WATCH → CRITICAL → RECOVERED state tracking.
 
 Data sources
 ------------
-  SR data  : ClickHouse  (payments.transactions_view)
+  SR data  : ClickHouse  (demo_db.transactions_view)
              Fast columnar reads, explicit IST timezone
   State    : Hive via Trino (demo_schema.sr_alert_state_log)
              Persists alert state across hourly runs
@@ -26,7 +26,7 @@ Pod note: no Airflow task-runner context inside the pod.
 Connections resolve from env vars only (AIRFLOW_CONN_* / AIRFLOW_VAR_*),
 pre-mounted by the DAG's make_kubernetes_python_task().
 
-Owner: arihantbahuguna0307@gmail.com
+Owner: demo-owner@demo.com
 """
 import json
 import logging
@@ -44,7 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 IST = pytz.timezone('Asia/Kolkata')
 
-DAG_OWNER = 'arihantbahuguna0307@gmail.com'
+DAG_OWNER = 'demo-owner@demo.com'
 
 # AI RCA bot — tagged in a follow-up message after every WATCH/CRITICAL alert.
 # It analyses the failure window and posts a root-cause summary automatically.
@@ -352,13 +352,13 @@ FROM (
         END AS payment_segment,
         count(id)                                                     AS attempts,
         round(countIf(authorized_at > 0) * 100.0 / count(id), 2)     AS success_rate
-    FROM payments.transactions_view
+    FROM demo_db.transactions_view
     WHERE merchant_id = '{merchant_id}'
       AND method = 'card'
       AND lower(type) IN ('credit', 'debit', 'prepaid')
       AND (international = 1
            OR (network = 'American Express' AND cards_country <> 'IN'))
-      AND internal_error_code NOT IN ('BAD_REQUEST_NON_3DS_INTERNATIONAL_NOT_ALLOWED')
+      AND internal_error_code NOT IN ('DEMO_BLOCKED_ERROR_CODE')
       AND created_at >= toUnixTimestamp(toStartOfHour(toTimeZone(now(), 'Asia/Kolkata'))) - (2 * 3600)
       AND created_at <  toUnixTimestamp(toStartOfHour(toTimeZone(now(), 'Asia/Kolkata')))
     GROUP BY 1, 2
@@ -376,13 +376,13 @@ SELECT
     'Overall'                                                         AS payment_segment,
     count(id)                                                         AS attempts,
     round(countIf(authorized_at > 0) * 100.0 / count(id), 2)         AS success_rate
-FROM payments.transactions_view
+FROM demo_db.transactions_view
 WHERE merchant_id = '{merchant_id}'
   AND method = 'card'
   AND lower(type) IN ('credit', 'debit', 'prepaid')
   AND (international = 1
        OR (network = 'American Express' AND cards_country <> 'IN'))
-  AND internal_error_code NOT IN ('BAD_REQUEST_NON_3DS_INTERNATIONAL_NOT_ALLOWED')
+  AND internal_error_code NOT IN ('DEMO_BLOCKED_ERROR_CODE')
   AND created_at >= toUnixTimestamp(toStartOfHour(toTimeZone(now(), 'Asia/Kolkata'))) - (2 * 3600)
   AND created_at <  toUnixTimestamp(toStartOfHour(toTimeZone(now(), 'Asia/Kolkata')))
 GROUP BY 1

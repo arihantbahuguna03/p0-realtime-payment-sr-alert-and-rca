@@ -30,7 +30,7 @@ Connection dependencies (seed before enabling):
     rendered into the pod as host/catalog by make_presto_env_vars()
 
 Schedule: Hourly at :15
-Owner   : arihantbahuguna0307@gmail.com
+Owner   : demo-owner@demo.com
 """
 from datetime import datetime, timedelta
 from functools import partial
@@ -40,7 +40,7 @@ from lib import email
 from lib.kube import make_kubernetes_python_task, make_presto_env_vars
 
 DAG_ID    = 'p0_sr_alert_agent'
-DAG_OWNER = 'arihantbahuguna0307@gmail.com'
+DAG_OWNER = 'demo-owner@demo.com'
 DAG_OWNERS = [DAG_OWNER]
 
 # Script runs inside the Kubernetes pod (not on the Airflow worker)
