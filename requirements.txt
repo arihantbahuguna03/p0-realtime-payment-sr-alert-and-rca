@@ -1,0 +1,5 @@
+apache-airflow>=3.0.0
+apache-airflow-providers-cncf-kubernetes>=8.0.0
+apache-airflow-providers-slack>=8.0.0
+clickhouse-driver>=0.2.7
+pytz>=2024.1
