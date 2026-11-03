@@ -1,220 +1,176 @@
-# P0 Payment SR Alert Agent (Airflow + Kubernetes + ClickHouse + Trino)
+# P0 Payment SR Alert Agent
 
-> Stateful card payment SR monitoring agent.
-> Airflow is a **thin scheduler only** — all SQL, data processing and alerting
-> run inside an isolated Kubernetes pod so a script crash never affects the
-> Airflow worker or any other DAG.
+Real-time success rate monitoring for international card payments, with automated root cause analysis. Detects SR drops, tracks alert state across hourly runs, and auto-triggers an AI RCA bot on every breach — giving the on-call team structured context before they've finished reading the alert.
+
+> Built Aug 2024–Aug 2025 using the Anthropic SDK, Apache Airflow, and Kubernetes — before MCP, Claude Code, and modern agentic tooling existed in production-ready form. Raw API integration on a production-grade infra stack.
 
 ---
 
-## What problem does this solve?
+## The Problem
 
-Card payment success rates (SR) can drop suddenly due to bank
-rejections, network outages, or gateway issues. The impact is large — even a
-5 % SR drop on a high-volume merchant means thousands of failed transactions.
+International card payment SR drops went undetected for hours. By the time an engineer noticed in a dashboard, the failure window was 2–3 hours old and thousands of transactions had failed silently. The on-call team needed:
 
-This agent:
+1. **Early detection** — catch a drop in the first hour, not after a manual check
+2. **Noise reduction** — don't fire on a single bad hour; confirm before escalating
+3. **Instant context** — when an alert fires, automatically start the RCA so the team isn't starting from zero
 
-1. Runs every hour and checks whether the last completed hour breached an
-   SR threshold for any of 12 monitored merchants.
-2. Applies a two-step state machine (WATCH → CRITICAL) to avoid false alerts
-   from single-hour anomalies.
-3. Posts a structured Slack alert and **automatically triggers an AI RCA bot**
-   to analyse the failure window and post a root-cause summary — all without
-   manual intervention.
+---
+
+## What It Does
+
+Runs every hour. For each monitored merchant:
+
+1. Fetches the last completed hour's SR data from ClickHouse (per payment segment)
+2. Checks each segment against calibrated per-merchant thresholds
+3. Applies a WATCH → CRITICAL → RECOVERED state machine
+4. Posts to Slack and auto-triggers an AI RCA bot on every breach
+
+**WATCH alert** (potential issue — 1 hour of breach):
+```
+*Demo Merchant 1 || P0 SR Alert*
+Generated at: 2026-01-15 14:15:00 IST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@oncall-pm @oncall-eng
+⚠️  WATCH LIST (Potential Alert)
+
+• Segment: Credit Card (Recurring - Auto)
+• Hour: 13:00
+• Threshold: >61 attempts, <60% SR
+• Detected: 88 attempts | 54.3% SR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**CRITICAL alert** (confirmed — 2 consecutive hours of breach):
+```
+*Demo Merchant 1 || P0 SR Alert*
+Generated at: 2026-01-15 15:15:00 IST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@oncall-pm @oncall-eng @team-lead
+🚨 CRITICAL ALERT (Action Required)
+
+• Segment: Credit Card (Recurring - Auto)
+• Started: 13:00 | Duration: 2 hours (13:00–15:00)
+• Threshold: >61 attempts, <60% SR
+• Hour 1 (13:00): 88 attempts | 54.3% SR
+• Hour 2 (14:00): 94 attempts | 51.8% SR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Each alert is immediately followed by an AI RCA bot message:
+```
+@rca-bot skills:sr-rca-analyzer
+Why was Demo Merchant 1 Credit Card (Recurring - Auto) SR low
+between 13:00 and 15:00 IST on 2026-01-15?
+```
+
+The RCA bot analyses the failure window and posts a structured root-cause summary — automatically, before anyone has to ask.
 
 ---
 
 ## Architecture
 
 ```
-Airflow (scheduler)
-        │
-        │  KubernetesPodOperator — launches ONE pod per run
-        │  (all credentials are env-var-mounted by make_kubernetes_python_task)
-        ▼
-┌──────────────────────────────────────────────────────────┐
-│                  Kubernetes Pod                          │
-│                                                          │
-│  script.py                                               │
-│    │                                                     │
-│    ├─► ClickHouse  ──── SR data for last 2 hours         │
-│    │   (columnar, fast, explicit IST timezone)           │
-│    │                                                     │
-│    ├─► Hive / Trino ─── persistent alert state table     │
-│    │   (WATCH / CRITICAL / RECOVERED rows)               │
-│    │                                                     │
-│    └─► Slack Webhook                                     │
-│         ├── human alert message (WATCH / CRITICAL / …)  │
-│         └── AI RCA bot message (auto root-cause query)  │
-└──────────────────────────────────────────────────────────┘
+Airflow Scheduler (cron: 15 * * * *)
+    └── KubernetesPodOperator
+            └── Isolated K8s Pod
+                    │
+                    ├── ClickHouse (read-only)
+                    │     └── SR query: per-merchant, per-segment, last 2 hours
+                    │
+                    ├── detect_alerts()
+                    │     └── checks last completed hour vs per-segment thresholds
+                    │
+                    ├── Hive via Trino
+                    │     └── load_state() — WATCH/ACTIVE state per merchant/segment
+                    │
+                    ├── classify_alerts()  ← state machine
+                    │     ├── WATCH     (new breach, 1 hour)
+                    │     ├── CRITICAL  (breach confirmed, 2+ consecutive hours)
+                    │     └── RECOVERED (breach cleared, volume sufficient)
+                    │
+                    ├── Slack
+                    │     ├── human alert message (WATCH / CRITICAL / RECOVERED)
+                    │     └── AI RCA bot message (auto-tagged after every breach)
+                    │
+                    └── Hive via Trino
+                          └── save_state() — persist updated state + history record
 ```
 
-### Why Kubernetes pod isolation?
+---
 
-| Without pod isolation | With pod isolation |
+## Key Design Decisions
+
+**1. Kubernetes pod isolation**
+
+The alert script runs inside a `KubernetesPodOperator` pod, not directly on the Airflow worker. This means:
+- A script crash, OOM, or timeout never affects the Airflow worker or other DAGs
+- The pod gets its own CPU/memory limits independent of the shared worker pool
+- Secrets are mounted as env vars from the secrets store — never in DAG code
+- The pod can be restarted or debugged independently
+
+The DAG's only job is scheduling and failure notification. All data work happens inside the pod.
+
+**2. State persisted to Hive, not in-memory**
+
+Alert state (which segments are in WATCH, which are CRITICAL) is written to a Hive table via Trino after every run. This means:
+- State survives pod restarts, Airflow worker restarts, and infra incidents
+- No false re-alerts when a pod crashes mid-run and restarts
+- Full audit history: every WATCH/CRITICAL/RECOVERED event is recorded with timestamp, SR value, and threshold
+
+**3. WATCH → CRITICAL two-step to reduce noise**
+
+A single bad hour could be a transient ClickHouse lag, a brief gateway blip, or low-volume statistical noise. The two-step state machine only escalates to CRITICAL when the breach holds for 2 consecutive hours. WATCH fires first so the team has early visibility without being paged.
+
+Edge case handled: if the WATCH entry is more than 1 hour old when the next breach arrives (gap detected — the hour in between was clean), the WATCH is refreshed rather than escalated. This prevents false CRITICALs from intermittent issues.
+
+**4. Per-merchant, per-segment thresholds**
+
+A single global SR threshold would produce false positives for naturally lower-SR segments and miss real drops on high-SR ones. Thresholds are calibrated per merchant per segment based on their historical volume profile and baseline SR. A segment is only evaluated if its volume exceeds `min_attempts` — avoiding alerts on statistically insignificant sample sizes.
+
+**5. AI RCA bot auto-triggered on every alert**
+
+Instead of the on-call team having to manually investigate, an AI RCA bot is tagged in a follow-up message immediately after every WATCH or CRITICAL. The bot receives a structured query (merchant, segment, time window) and posts a root-cause summary. By the time the engineer reads the alert, the RCA is already in the thread.
+
+---
+
+## Files
+
+| File | Description |
 |---|---|
-| Script crash kills the Airflow worker | Crash is contained to the pod; worker is unaffected |
-| All DAGs share one Python environment | Pod gets its own image, dependencies, CPU/memory limits |
-| Secrets live in DAG code or Airflow vars | Secrets are mounted as env vars from a secrets store |
-| Hard to debug a single script run | Pod logs are queryable independently; pod can be re-run |
+| `dag.py` | Airflow DAG — schedules the K8s pod, handles failure callbacks |
+| `script.py` | Alert script — runs inside the pod: SR fetch, detection, state machine, Slack posting |
+| `merchant_config.example.py` | Template for merchant thresholds (copy → `merchant_config.py`, gitignored) |
+| `requirements.txt` | Dependencies |
 
-Airflow does exactly **one thing** in `dag.py`: schedule the pod via
-`KubernetesPodOperator`. Every query, threshold check, state update and Slack
-post happens inside `script.py` running in the pod.
-
----
-
-## Alert state machine
-
-```
-               ┌─────────────────────────────────┐
-               │         No breach                │
-               │    (SR above threshold OR         │
-               │     volume below min_attempts)    │
-               └─────────────────────────────────┘
-                           ▲           ▲
-               CLEARED     │           │ RECOVERED
-               (auto)      │           │ (auto, only if volume OK)
-                           │           │
-┌──────────┐  breach    ┌──────────┐  breach   ┌──────────────┐
-│  (idle)  │ ─────────► │  WATCH   │ confirmed │   CRITICAL   │
-│          │            │ (hour 1) │ ─────────►│  (hour 2+)   │
-└──────────┘            └──────────┘  (1h gap) └──────────────┘
-                             │                       │
-                             └── Slack + RCA bot ────┘
-```
-
-- **WATCH** — first hour of breach detected. A "potential issue" alert is
-  posted. The AI RCA bot is tagged with a 1-hour analysis window.
-- **CRITICAL** — breach confirmed in the **next consecutive** hour. An
-  "action required" alert is posted. The AI RCA bot gets the full multi-hour
-  window.
-- **RECOVERED** — SR returns above threshold with sufficient volume. A
-  recovery message is posted and the alert is closed.
-- **CLEARED** — watch entry expires without escalating (gap in data, or SR
-  recovered before hour 2). Silently removed from state.
-
-State is persisted in Hive (`hive.demo_schema.sr_alert_state_log`) so it
-survives Airflow restarts and pod recycling.
-
----
-
-## Payment method segmentation
-
-Each transaction is classified into one of 9 demo buckets by card
-attributes and transaction type (names are illustrative — replace with
-your own taxonomy):
-
-| Bucket | Description |
-|---|---|
-| Demo Payment Method 1 | Card type A — One-time |
-| Demo Payment Method 2 | Card type B — One-time |
-| Demo Payment Method 3 | Card type C — One-time |
-| Demo Payment Method 4 | Card type A — Recurring (auto) |
-| Demo Payment Method 5 | Card type A — Recurring (initial/change) |
-| Demo Payment Method 6 | Card type B — Recurring (auto) |
-| Demo Payment Method 7 | Card type B — Recurring (initial/change) |
-| Demo Payment Method 8 | Card type C — Recurring (auto) |
-| Demo Payment Method 9 | Card type C — Recurring (initial/change) |
-
-An **Overall** row (all segments combined) is also checked. Each merchant
-config specifies which segments to watch and their individual thresholds.
-
----
-
-## Key design decisions
-
-| Decision | Rationale |
-|---|---|
-| **Pod isolation** | Script crashes never affect the Airflow worker or other DAGs. Resource limits can be tuned per pod without touching the scheduler. |
-| **Connections via env vars in pod** | `KubernetesPodOperator` has no Airflow task-runner context inside the pod. `BaseHook.get_connection()` resolves from `AIRFLOW_CONN_*` env vars, which are pre-mounted by `make_kubernetes_python_task()`. |
-| **Stateful state machine (2-hour confirmation)** | A single-hour anomaly (network blip, delayed data) should not page an on-call engineer. Requiring two consecutive hours filters noise. |
-| **Explicit `toTimeZone(..., 'Asia/Kolkata')`** | ClickHouse server timezone is unreliable in cloud deployments. IST is baked into every timestamp operation rather than trusting a server setting. |
-| **Hive for state storage** | State must survive across hourly runs and Airflow restarts. Hive (via Trino) is the existing data-lake store, avoiding a new dependency. |
-| **AI RCA bot trigger** | Every alert fires a tagged Slack message to an AI bot that queries the failure window and posts a root-cause summary automatically, reducing MTTR without manual analyst involvement. |
-| **Per-merchant per-segment thresholds** | Different merchants have very different SR baselines. A 60 % SR is fine for some and a P0 for others. Thresholds are configured per merchant × segment. |
-| **Low-volume guard on RECOVERED** | If volume drops below `min_attempts`, an SR of 100 % is meaningless. Recovery is only declared when volume is sufficient to be statistically meaningful. |
-| **`retries=0` on the DAG** | A retry after a Trino or ClickHouse timeout makes things worse. The pod fails fast; on-call investigates with full pod logs. |
-
----
-
-## Sample Slack alert
-
-```
-*Demo Merchant 1 || P0 SR Alert*
-Generated at: 2026-01-15 14:15:00 IST
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-@alice @bob @charlie
-🚨 *CRITICAL ALERT (Action Required)*
-
-• Segment: Demo Payment Method 1
-• Started: 12:00 | Duration: 2 hours (12:00–14:00)
-• Threshold: >50 attempts, <57% SR
-• Hour 1 (12:00): 312 attempts | 49.4% SR
-• Hour 2 (13:00): 287 attempts | 46.1% SR
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@DEMO_RCA_BOT skills:sr-rca-analyzer
-Why was Demo Merchant 1 (mid DEMO_MID_001) Demo Payment Method 1 SR low
-between 12:00 and 14:00 IST on 2026-01-15?
-```
-
----
-
-## Stack
-
-| Component | Technology |
-|---|---|
-| Orchestration | Apache Airflow v3 |
-| Pod execution | Kubernetes (`KubernetesPodOperator`) |
-| SR data | ClickHouse (columnar DB) |
-| State storage | Hive via Trino |
-| Alerting | Slack Webhooks |
-| Timezone handling | `pytz` |
-| Language | Python 3.11+ |
+**Note on thresholds and SQL:** Per-merchant alert thresholds and the SR segmentation query contain calibrated production values. They are not included in this demo repo. `merchant_config.example.py` shows the expected structure. Available on request.
 
 ---
 
 ## Configuration
 
-All credentials live in the Airflow connection/variable store — no secrets in
-DAG or script code.
+**Required Airflow connections (pre-mounted as env vars inside the pod):**
+- `clickhouse_readonly_default` — ClickHouse host/port/user/password/schema
+- `slack_default` — Slack webhook token
+- `presto_default` — Trino/Presto host for Hive state table
+- `AIRFLOW_VAR_DEFAULT_CATALOG` — Trino catalog name
 
-| Connection / Variable | Used for |
-|---|---|
-| `clickhouse_readonly_default` | ClickHouse host, port, read-only credentials |
-| `slack_default` | Slack webhook for alert delivery |
-| `presto_default` | Trino host for state table reads/writes |
-| `AIRFLOW_VAR_DEFAULT_CATALOG` | Trino default catalog (rendered into pod env) |
-
----
-
-## File structure
-
-```
-p0-payment-alert-agent/
-├── dag.py          # Airflow DAG — launches the Kubernetes pod
-├── script.py       # Script that runs inside the pod
-├── requirements.txt
-└── README.md
-```
-
-> **Note:** `lib/kube.py`, `lib/presto.py`, `lib/slack.py` and `lib/email.py`
-> are internal helpers that wrap `KubernetesPodOperator`, Trino CLI, Slack
-> webhooks and Airflow email utilities. They are not included here as they
-> contain organisation-specific routing logic.
+**Merchant thresholds:**
+Copy `merchant_config.example.py` → `merchant_config.py` and configure each merchant's per-segment `min_attempts` and `sr_threshold`.
 
 ---
 
-## What I'd add next
+## Stack
 
-- [ ] Prometheus metrics export (attempts + SR per segment as gauges)
-- [ ] Dead-man's-switch alert: page on-call if the pod fails to run at all
-- [ ] Unit tests for `classify_alerts` and the state machine transitions
-- [ ] Configurable per-run lookback window (currently fixed at 2 hours)
+- Apache Airflow 2.9+ with KubernetesPodOperator
+- ClickHouse (`clickhouse-driver`) — SR data source
+- Hive via Trino (`trino`) — alert state persistence
+- Slack SDK (`slack_sdk`) — alert delivery
+- Python 3.11+, pytz
 
 ---
 
-*Built as part of a payments observability platform. Merchant IDs, Slack user
-IDs, channel IDs, and internal table names have been anonymised.*
+## What I'd Change Today
+
+- Replace Hive/Trino state store with Redis — sub-millisecond reads, simpler infra, same durability with AOF persistence
+- Add a volume-weighted SR baseline (rolling 7-day) so thresholds self-adjust for merchants with seasonal volume patterns
+- Surface the AI RCA output back into the Airflow task log so post-incident review has a complete timeline in one place

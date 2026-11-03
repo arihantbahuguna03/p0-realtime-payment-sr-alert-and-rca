@@ -2,14 +2,14 @@
 P0 Payment SR Alert Script — Kubernetes Pod
 ============================================
 Runs inside an isolated Kubernetes pod (launched by dag.py).
-Detects international card payment SR drops and posts structured
-Slack alerts with WATCH → CRITICAL → RECOVERED state tracking.
+Detects payment SR drops and posts structured Slack alerts with
+WATCH → CRITICAL → RECOVERED state tracking.
 
 Data sources
 ------------
-  SR data  : ClickHouse  (demo_db.transactions_view)
-             Fast columnar reads, explicit IST timezone
-  State    : Hive via Trino (demo_schema.sr_alert_state_log)
+  SR data  : ClickHouse  (columnar DB, IST-explicit window)
+             Fast columnar reads, per-merchant per-segment SR
+  State    : Hive via Trino (persistent alert state log)
              Persists alert state across hourly runs
 
 Alert state machine
@@ -85,310 +85,62 @@ def get_clickhouse_client():
 # ============================================================================
 # MERCHANT CONFIG
 # ============================================================================
-# Each merchant has:
-#   merchant_id          — data warehouse key
-#   thresholds           — per-payment-method (min_attempts, sr_threshold)
-#   mention_users_watch  — Slack users tagged on WATCH alerts
-#   mention_users_critical — Slack users tagged on CRITICAL alerts
+# Loaded from merchant_config.py (gitignored — not in this demo repo).
+# See merchant_config.example.py for the expected structure.
 #
-# Demo data — real merchant IDs, names and Slack IDs are omitted.
+# Each merchant entry contains:
+#   merchant_id            — data warehouse key
+#   thresholds             — per-payment-method {min_attempts, sr_threshold}
+#   mention_users_watch    — Slack users tagged on WATCH alerts
+#   mention_users_critical — Slack users tagged on CRITICAL alerts
 
-MERCHANTS = [
-    {
-        'merchant_id': 'DEMO_MID_001',
-        'name': 'Demo Merchant 1',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002', 'DEMO_USER_003'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 80, 'sr_threshold': 55,
-            },
-            'Demo Payment Method 1': {
-                'min_attempts': 50, 'sr_threshold': 57,
-            },
-            'Demo Payment Method 2': {
-                'min_attempts': 61, 'sr_threshold': 60,
-            },
-            'Demo Payment Method 3': {
-                'min_attempts': 13, 'sr_threshold': 36,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_002',
-        'name': 'Demo Merchant 2',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002', 'DEMO_USER_003'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 15, 'sr_threshold': 25,
-            },
-            'Demo Payment Method 1': {
-                'min_attempts': 7, 'sr_threshold': 15,
-            },
-            'Demo Payment Method 2': {
-                'min_attempts': 8, 'sr_threshold': 15,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_003',
-        'name': 'Demo Merchant 3',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002', 'DEMO_USER_004'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 80, 'sr_threshold': 45,
-            },
-            'Demo Payment Method 1': {
-                'min_attempts': 40, 'sr_threshold': 48,
-            },
-            'Demo Payment Method 2': {
-                'min_attempts': 39, 'sr_threshold': 50,
-            },
-            'Demo Payment Method 3': {
-                'min_attempts': 16, 'sr_threshold': 10,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_004',
-        'name': 'Demo Merchant 4',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002', 'DEMO_USER_004'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 33, 'sr_threshold': 40,
-            },
-            'Demo Payment Method 1': {
-                'min_attempts': 20, 'sr_threshold': 35,
-            },
-            'Demo Payment Method 2': {
-                'min_attempts': 15, 'sr_threshold': 50,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_005',
-        'name': 'Demo Merchant 5',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002', 'DEMO_USER_005'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 13, 'sr_threshold': 30,
-            },
-            'Demo Payment Method 1': {
-                'min_attempts': 10, 'sr_threshold': 30,
-            },
-            'Demo Payment Method 2': {
-                'min_attempts': 10, 'sr_threshold': 30,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_006',
-        'name': 'Demo Merchant 6',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002', 'DEMO_USER_006'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 28, 'sr_threshold': 60,
-            },
-            'Demo Payment Method 1': {
-                'min_attempts': 16, 'sr_threshold': 60,
-            },
-            'Demo Payment Method 2': {
-                'min_attempts': 11, 'sr_threshold': 60,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_007',
-        'name': 'Demo Merchant 7',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 40, 'sr_threshold': 60,
-            },
-            'Demo Payment Method 1': {
-                'min_attempts': 11, 'sr_threshold': 60,
-            },
-            'Demo Payment Method 2': {
-                'min_attempts': 25, 'sr_threshold': 62,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_008',
-        'name': 'Demo Merchant 8',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 50, 'sr_threshold': 65,
-            },
-            'Demo Payment Method 1': {
-                'min_attempts': 15, 'sr_threshold': 70,
-            },
-            'Demo Payment Method 2': {
-                'min_attempts': 18, 'sr_threshold': 60,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_009',
-        'name': 'Demo Merchant 9',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 32, 'sr_threshold': 56,
-            },
-            'Demo Payment Method 1': {
-                'min_attempts': 26, 'sr_threshold': 58,
-            },
-            'Demo Payment Method 2': {
-                'min_attempts': 11, 'sr_threshold': 30,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_010',
-        'name': 'Demo Merchant 10',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 12, 'sr_threshold': 10,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_011',
-        'name': 'Demo Merchant 11',
-        'enabled': True,
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001', 'DEMO_USER_002'],
-        'mention_users_critical': ['DEMO_USER_001', 'DEMO_USER_002'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 12, 'sr_threshold': 10,
-            },
-        },
-    },
-    {
-        'merchant_id': 'DEMO_MID_012',
-        'name': 'Demo Merchant 12',
-        'enabled': False,   # disabled — example of toggling a merchant off
-        'channel_id': 'C_DEMO_ALERT_CHANNEL',
-        'mention_users_watch':    ['DEMO_USER_001'],
-        'mention_users_critical': ['DEMO_USER_001'],
-        'thresholds': {
-            'Overall': {
-                'min_attempts': 20, 'sr_threshold': 50,
-            },
-        },
-    },
-]
+def _load_merchants() -> list[dict]:
+    """
+    Load merchant config with per-segment alert thresholds.
+
+    Thresholds are calibrated per merchant based on their historical
+    volume profile and business SLA. They are not included in this
+    demo repo — see merchant_config.example.py for structure.
+
+    Implementation: proprietary — available on request.
+    """
+    try:
+        from merchant_config import MERCHANTS
+        return MERCHANTS
+    except ImportError:
+        raise RuntimeError(
+            "merchant_config.py not found. "
+            "Copy merchant_config.example.py → merchant_config.py and fill in your values."
+        )
+
+MERCHANTS = _load_merchants()
 
 
 # ============================================================================
-# SQL — SR DATA  (ClickHouse, IST-explicit, 9 payment segments + Overall)
+# SQL — SR DATA
 # ============================================================================
-# Runs once per merchant inside the pod.
-# Two-hour lookback: last completed hour + one buffer hour.
 
-SR_QUERY = """
-SELECT hour_interval, payment_segment, attempts, success_rate
-FROM (
-    SELECT
-        formatDateTime(
-            toStartOfHour(toTimeZone(fromUnixTimestamp(created_at), 'Asia/Kolkata')),
-            '%Y-%m-%d %H:00:00'
-        ) AS hour_interval,
-        -- Nine-way segmentation: card_type x recurrence
-        -- Segment names are illustrative — replace with your taxonomy.
-        CASE
-            WHEN lower(type) = 'credit'  AND recurring = 0
-                THEN 'Demo Payment Method 1'
-            WHEN lower(type) = 'debit'   AND recurring = 0
-                THEN 'Demo Payment Method 2'
-            WHEN lower(type) = 'prepaid' AND recurring = 0
-                THEN 'Demo Payment Method 3'
-            WHEN lower(type) = 'credit'  AND recurring = 1 AND recurring_type = 'auto'
-                THEN 'Demo Payment Method 4'
-            WHEN lower(type) = 'credit'  AND recurring = 1 AND recurring_type IN ('initial', 'card_change')
-                THEN 'Demo Payment Method 5'
-            WHEN lower(type) = 'debit'   AND recurring = 1 AND recurring_type = 'auto'
-                THEN 'Demo Payment Method 6'
-            WHEN lower(type) = 'debit'   AND recurring = 1 AND recurring_type IN ('initial', 'card_change')
-                THEN 'Demo Payment Method 7'
-            WHEN lower(type) = 'prepaid' AND recurring = 1 AND recurring_type = 'auto'
-                THEN 'Demo Payment Method 8'
-            WHEN lower(type) = 'prepaid' AND recurring = 1 AND recurring_type IN ('initial', 'card_change')
-                THEN 'Demo Payment Method 9'
-            ELSE NULL
-        END AS payment_segment,
-        count(id)                                                     AS attempts,
-        round(countIf(authorized_at > 0) * 100.0 / count(id), 2)     AS success_rate
-    FROM demo_db.transactions_view
-    WHERE merchant_id = '{merchant_id}'
-      AND method = 'card'
-      AND lower(type) IN ('credit', 'debit', 'prepaid')
-      AND (international = 1
-           OR (network = 'American Express' AND cards_country <> 'IN'))
-      AND internal_error_code NOT IN ('DEMO_BLOCKED_ERROR_CODE')
-      AND created_at >= toUnixTimestamp(toStartOfHour(toTimeZone(now(), 'Asia/Kolkata'))) - (2 * 3600)
-      AND created_at <  toUnixTimestamp(toStartOfHour(toTimeZone(now(), 'Asia/Kolkata')))
-    GROUP BY 1, 2
-) AS segments
-WHERE payment_segment IS NOT NULL AND payment_segment != ''
+def _load_sr_query() -> str:
+    """
+    Returns the ClickHouse SQL that fetches per-segment success rates
+    for a single merchant over the last 2 completed hours (IST-explicit).
 
-UNION ALL
+    Query design:
+      - Maps transactions to one of nine payment segments using a CASE
+        block keyed on card type and recurrence pattern
+      - Appends an Overall row (no segmentation) via UNION ALL so a
+        single query returns both granularities
+      - Excludes a known non-actionable error code from the denominator
+        so it doesn't mask genuine SR degradation
+      - All timestamps cast to IST explicitly to be independent of the
+        ClickHouse server's system timezone
 
--- Overall row — same window, no segmentation
-SELECT
-    formatDateTime(
-        toStartOfHour(toTimeZone(fromUnixTimestamp(created_at), 'Asia/Kolkata')),
-        '%Y-%m-%d %H:00:00'
-    )                                                                 AS hour_interval,
-    'Overall'                                                         AS payment_segment,
-    count(id)                                                         AS attempts,
-    round(countIf(authorized_at > 0) * 100.0 / count(id), 2)         AS success_rate
-FROM demo_db.transactions_view
-WHERE merchant_id = '{merchant_id}'
-  AND method = 'card'
-  AND lower(type) IN ('credit', 'debit', 'prepaid')
-  AND (international = 1
-       OR (network = 'American Express' AND cards_country <> 'IN'))
-  AND internal_error_code NOT IN ('DEMO_BLOCKED_ERROR_CODE')
-  AND created_at >= toUnixTimestamp(toStartOfHour(toTimeZone(now(), 'Asia/Kolkata'))) - (2 * 3600)
-  AND created_at <  toUnixTimestamp(toStartOfHour(toTimeZone(now(), 'Asia/Kolkata')))
-GROUP BY 1
-
-ORDER BY hour_interval, payment_segment
-"""
+    Implementation: proprietary — available on request.
+    """
+    raise NotImplementedError(
+        "Production SR query not included in demo repo. "
+        "Contact demo-owner@demo.com to discuss implementation."
+    )
 
 
 # ============================================================================
@@ -815,7 +567,7 @@ def format_rca_request(merchant: dict, tier: str, alert: dict) -> str:
     """
     Plain-English message tagging the AI RCA bot.
     The bot analyses the failure window and posts a root-cause summary.
-    WATCH  → 1-hour window
+    WATCH    → 1-hour window
     CRITICAL → from first breach hour to end of last breach hour
     """
     mid    = merchant['merchant_id']
@@ -885,7 +637,7 @@ def main() -> None:
             sr_data = None
             for attempt in range(2):
                 try:
-                    rows    = ch_client.execute(SR_QUERY.format(merchant_id=mid))
+                    rows    = ch_client.execute(_load_sr_query().format(merchant_id=mid))
                     sr_data = [
                         dict(zip(['hour_interval', 'payment_segment', 'attempts', 'success_rate'], r))
                         for r in rows
